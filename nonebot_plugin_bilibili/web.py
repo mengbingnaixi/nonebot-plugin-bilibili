@@ -7,7 +7,6 @@ import secrets
 from pathlib import Path
 from typing import Annotated
 from hmac import compare_digest
-from importlib.resources import files
 
 from pydantic import Field, BaseModel
 from nonebot.adapters.onebot.v11 import Bot
@@ -166,7 +165,7 @@ async def login_page(request: Request) -> Response:
     if await _is_authorized(request):
         return RedirectResponse(f"{plugin_config.bili_subscription_web_path}/", status_code=303)
     source = (
-        files("nonebot_plugin_bilibili")
+        Path(__file__).resolve().parent
         .joinpath("resources/login.html")
         .read_text(encoding="utf-8")
     )
@@ -206,7 +205,7 @@ async def index(request: Request) -> Response:
             f"{plugin_config.bili_subscription_web_path}/login", status_code=303
         )
     source = (
-        files("nonebot_plugin_bilibili").joinpath("resources/web.html").read_text(encoding="utf-8")
+        Path(__file__).resolve().parent.joinpath("resources/web.html").read_text(encoding="utf-8")
     )
     return HTMLResponse(source)
 
