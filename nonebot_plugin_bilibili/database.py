@@ -256,6 +256,18 @@ class Repository:
             ).fetchall()
         return [int(row[0]) for row in rows]
 
+    async def get_uname(self, uid: int) -> str:
+        # Return the UP name saved in subscriptions, empty string if not found
+        async with self._connect() as db:
+            row = await (
+                await db.execute(
+                    "SELECT uname FROM subscriptions "
+                    "WHERE uid=? AND uname != '' LIMIT 1",
+                    (uid,),
+                )
+            ).fetchone()
+        return str(row[0]) if row else ""
+
     async def groups_for_uid(self, uid: int) -> list[Subscription]:
         subscriptions = await self.list_subscriptions()
         return [item for item in subscriptions if item.uid == uid]

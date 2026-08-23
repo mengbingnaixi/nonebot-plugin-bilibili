@@ -107,6 +107,19 @@ class BilibiliApi:
         card = payload.get("data", {}).get("card", {})
         return str(card.get("name") or uid), str(card.get("face") or "")
 
+    async def _get_anchor(self, uid: int) -> tuple[str, str]:
+        # Fetch anchor name/avatar; retry once on failure, then fall back to the stored subscription name
+        for attempt in range(2):
+            try:
+                return await self.get_profile(uid)
+            except BilibiliApiError:
+                if attempt == 0:
+                    await asyncio.sleep(1)
+                    continue
+                fallback = await repository.get_uname(uid)
+                return (fallback or str(uid)), ""
+        return str(uid), ""  # pragma: no cover
+
     async def get_dynamics(self, uid: int) -> list[PushContent]:
         payload = await self._get_json(
             f"{self.API}/x/polymer/web-dynamic/v1/feed/space",
@@ -342,10 +355,7 @@ class BilibiliApi:
         )
         room_info = payload.get("data") or {}
         uid = int(room_info.get("uid") or fallback_uid)
-        try:
-            anchor_name, anchor_avatar = await self.get_profile(uid)
-        except BilibiliApiError:
-            anchor_name, anchor_avatar = str(uid), ""
+        anchor_name, anchor_avatar = await self._get_anchor(uid)
         actual_action = action
         if actual_action is None:
             actual_action = (
