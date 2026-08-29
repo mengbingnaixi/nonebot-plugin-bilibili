@@ -270,7 +270,11 @@ async def scan_groups() -> dict[str, object]:
 
 @router.post("/api/subscriptions", dependencies=protected)
 async def add_subscription(body: SubscriptionBody) -> dict[str, object]:
-    uname, avatar = await bilibili_api.get_profile(body.uid)
+    try:
+        uname, avatar = await bilibili_api.get_profile(body.uid)
+    except BilibiliApiError as exc:
+        logger.warning("获取 UP 主信息失败（{}），暂以 UID 作为昵称订阅", exc)
+        uname, avatar = str(body.uid), ""
     added = await repository.add_subscription(
         body.group_id, body.uid, uname, avatar, body.group_name
     )

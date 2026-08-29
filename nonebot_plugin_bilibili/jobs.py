@@ -85,6 +85,7 @@ async def poll_dynamics() -> None:
         return
     async with _dynamic_lock:
         semaphore = asyncio.Semaphore(plugin_config.bili_subscription_request_concurrency)
+        failures: list[tuple[int, str]] = []
 
         async def check(uid: int) -> None:
             async with semaphore:
@@ -152,12 +153,25 @@ async def poll_dynamics() -> None:
                             )
                             return
                         await repository.set_state("dynamic", str(uid), item.id)
-                except Exception:
-                    logger.exception(
-                        "Bilibili subscription: dynamic polling failed for uid {}", uid
+                except Exception as exc:
+                    failures.append((uid, str(exc)))
+                    logger.opt(exception=True).debug(
+                        "Bilibili subscription: dynamic polling failed for uid {}: {}",
+                        uid,
+                        exc,
                     )
 
-        await asyncio.gather(*(check(uid) for uid in await repository.list_uids()))
+        uids = await repository.list_uids()
+        await asyncio.gather(*(check(uid) for uid in uids))
+        if failures:
+            logger.warning(
+                "Bilibili subscription: dynamic polling failed for {}/{} subscriptions "
+                "(e.g. uid {}: {}); details are available at DEBUG log level",
+                len(failures),
+                len(uids),
+                failures[0][0],
+                failures[0][1],
+            )
 
 
 async def poll_lives() -> None:
@@ -165,6 +179,7 @@ async def poll_lives() -> None:
         return
     async with _live_lock:
         semaphore = asyncio.Semaphore(plugin_config.bili_subscription_request_concurrency)
+        failures: list[tuple[int, str]] = []
 
         async def check(uid: int) -> None:
             async with semaphore:
@@ -211,10 +226,25 @@ async def poll_lives() -> None:
                             )
                 except NoLiveRoomError:
                     return
-                except Exception:
-                    logger.exception("Bilibili subscription: live polling failed for uid {}", uid)
+                except Exception as exc:
+                    failures.append((uid, str(exc)))
+                    logger.opt(exception=True).debug(
+                        "Bilibili subscription: live polling failed for uid {}: {}",
+                        uid,
+                        exc,
+                    )
 
-        await asyncio.gather(*(check(uid) for uid in await repository.list_uids()))
+        uids = await repository.list_uids()
+        await asyncio.gather(*(check(uid) for uid in uids))
+        if failures:
+            logger.warning(
+                "Bilibili subscription: live polling failed for {}/{} subscriptions "
+                "(e.g. uid {}: {}); details are available at DEBUG log level",
+                len(failures),
+                len(uids),
+                failures[0][0],
+                failures[0][1],
+            )
 
 
 def install_jobs() -> None:
