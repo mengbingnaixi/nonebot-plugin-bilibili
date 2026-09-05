@@ -8,7 +8,6 @@ import mimetypes
 from pathlib import Path
 from contextlib import suppress
 from urllib.parse import urlparse
-from importlib.resources import files
 
 from nonebot import logger
 from jinja2.sandbox import SandboxedEnvironment
@@ -146,7 +145,7 @@ class CardRenderer:
             "live": "live.html",
         }.get(content.kind.value, "dynamic.html")
         return (
-            files("nonebot_plugin_bilibili")
+            Path(__file__).resolve().parent
             .joinpath(f"resources/{template_name}")
             .read_text(encoding="utf-8")
         )

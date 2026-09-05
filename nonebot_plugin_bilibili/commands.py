@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Annotated
 
 from nonebot.matcher import Matcher
@@ -47,6 +48,14 @@ def _positive_int(value: str, label: str) -> int:
     return int(value)
 
 
+def _parse_uid(value: str) -> int:
+    """Parse UID, accepting formats like "UID:9200471" from the Bilibili mobile app."""
+    text = re.sub(r"^(?:uid\s*[:：]?\s*)", "", value.strip(), flags=re.IGNORECASE)
+    if not text.isdigit() or int(text) <= 0:
+        raise ValueError("UID 格式错误，请输入纯数字或 UID:数字")
+    return int(text)
+
+
 async def _group_name(bot: Bot, group_id: int) -> str:
     try:
         info = await bot.get_group_info(group_id=group_id, no_cache=False)
@@ -75,7 +84,7 @@ async def _handle_add(matcher: Matcher, bot: Bot, ctx: CommandContext) -> None:
     _require_manage(ctx)
     if len(ctx.tokens) != 2:
         raise ValueError("用法：/bili add <uid> [-群号]")
-    uid = _positive_int(ctx.tokens[1], "UID")
+    uid = _parse_uid(ctx.tokens[1])
     uname, avatar = await bilibili_api.get_profile(uid)
     added = await repository.add_subscription(
         ctx.group_id or 0,
@@ -91,7 +100,7 @@ async def _handle_del(matcher: Matcher, ctx: CommandContext) -> None:
     _require_manage(ctx)
     if len(ctx.tokens) != 2:
         raise ValueError("用法：/bili del <uid> [-群号]")
-    uid = _positive_int(ctx.tokens[1], "UID")
+    uid = _parse_uid(ctx.tokens[1])
     removed = await repository.remove_subscription(ctx.group_id or 0, uid)
     await matcher.finish("已取消订阅" if removed else "本群没有该订阅")
 
@@ -142,7 +151,7 @@ async def _handle_atall(matcher: Matcher, ctx: CommandContext) -> None:
     switch = ctx.tokens[2].lower()
     if switch not in {"on", "off"}:
         raise ValueError("开关必须是 on 或 off")
-    uid = _positive_int(ctx.tokens[3], "UID")
+    uid = _parse_uid(ctx.tokens[3])
     updated = await repository.set_atall(group_id, uid, kind, switch == "on")
     summary = ", ".join(sorted(updated)) if updated else "全部关闭"
     await matcher.finish(f"UID {uid} 的 @全体配置：{summary}")

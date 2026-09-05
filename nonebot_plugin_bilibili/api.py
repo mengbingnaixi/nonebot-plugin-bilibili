@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import re
 import asyncio
+import time
 from typing import Any
 from urllib.parse import urlparse, unquote_plus
 from datetime import datetime, timezone, timedelta
 
 import httpx
+
+from nonebot import logger
 
 from .database import repository
 from .config import plugin_config
@@ -23,6 +26,11 @@ class NoLiveRoomError(BilibiliApiError):
 
 REQUEST_ATTEMPTS = 3
 REQUEST_RETRY_DELAY = 0.5
+# 连续多少个请求（每个请求内部已重试 REQUEST_ATTEMPTS 次）都因网络层错误失败时，
+# 判定长期复用的连接池已失效，主动重建 HTTP 客户端再试一轮（等效于不重启 bot 重置网络层）。
+CONSECUTIVE_FAILED_REQUESTS_TO_RESET = 2
+# 重建冷却时间：网络持续故障时避免疯狂重建连接池
+POOL_RESET_COOLDOWN_SECONDS = 30.0
 BILIBILI_TIMEZONE = timezone(timedelta(hours=8))
 
 
@@ -33,26 +41,94 @@ class BilibiliApi:
 
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
+        self._client_generation = 0
         self._client_lock = asyncio.Lock()
+        self._consecutive_failed_requests = 0
+        self._last_pool_reset = 0.0
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            async with self._client_lock:
-                if self._client is None:
-                    self._client = httpx.AsyncClient(
-                        timeout=plugin_config.bili_subscription_request_timeout,
-                        follow_redirects=True,
-                        headers={
-                            "User-Agent": plugin_config.bili_subscription_user_agent,
-                            "Referer": "https://www.bilibili.com/",
-                        },
-                    )
-        return self._client
+    def _build_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=plugin_config.bili_subscription_request_timeout,
+            follow_redirects=True,
+            headers={
+                "User-Agent": plugin_config.bili_subscription_user_agent,
+                "Referer": "https://www.bilibili.com/",
+            },
+        )
+
+    async def _get_client(self) -> tuple[httpx.AsyncClient, int]:
+        """返回当前客户端及其代号；代号用于并发重建时避免误关新客户端。"""
+        async with self._client_lock:
+            if self._client is None:
+                self._client = self._build_client()
+                self._client_generation += 1
+                logger.debug(
+                    "Bilibili subscription: created new HTTP client (generation {})",
+                    self._client_generation,
+                )
+            return self._client, self._client_generation
 
     async def close(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        async with self._client_lock:
+            if self._client is not None:
+                client, self._client = self._client, None
+                self._client_generation += 1
+                await client.aclose()
+
+    async def _reset_client(self, generation: int) -> None:
+        """丢弃疑似失效的连接池；若并发的其他请求已先行重建则直接跳过。"""
+        async with self._client_lock:
+            if self._client is None or generation != self._client_generation:
+                return
+            client, self._client = self._client, None
+            self._client_generation += 1
+            self._consecutive_failed_requests = 0
+            try:
+                await client.aclose()
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "Bilibili subscription: failed to close stale HTTP client"
+                )
+
+    async def _get_response(
+        self, url: str, params: dict[str, Any] | None, cookies: dict[str, str] | None
+    ) -> httpx.Response:
+        """带重试的 GET；网络层持续失败时重建连接池（自愈）后额外重试一轮。"""
+        rebuilt = False
+        while True:
+            last_error: httpx.TransportError | None = None
+            for attempt in range(REQUEST_ATTEMPTS):
+                client, generation = await self._get_client()
+                try:
+                    response = await client.get(url, params=params, cookies=cookies)
+                    self._consecutive_failed_requests = 0
+                    return response
+                except httpx.TransportError as exc:
+                    last_error = exc
+                    if attempt < REQUEST_ATTEMPTS - 1:
+                        await asyncio.sleep(REQUEST_RETRY_DELAY * (2**attempt))
+            # 一整轮 REQUEST_ATTEMPTS 次全部失败
+            self._consecutive_failed_requests += 1
+            if (
+                not rebuilt
+                and self._consecutive_failed_requests
+                >= CONSECUTIVE_FAILED_REQUESTS_TO_RESET
+                and time.monotonic() - self._last_pool_reset
+                > POOL_RESET_COOLDOWN_SECONDS
+            ):
+                rebuilt = True
+                logger.warning(
+                    "Bilibili subscription: 连续 {} 个请求连接 B 站失败，判定连接池失效，"
+                    "正在重建 HTTP 客户端并再重试一轮",
+                    self._consecutive_failed_requests,
+                )
+                await self._reset_client(generation)
+                self._last_pool_reset = time.monotonic()
+                continue
+            attempts = REQUEST_ATTEMPTS * (2 if rebuilt else 1)
+            raise BilibiliApiError(
+                f"连接 B 站失败，已重试 {attempts} 次：{last_error}"
+            ) from last_error
 
     async def _cookies(self) -> dict[str, str]:
         raw = await repository.get_setting("bilibili_cookie")
@@ -73,21 +149,19 @@ class BilibiliApi:
     async def _request_json(
         self, url: str, params: dict[str, Any] | None = None, *, use_cookie: bool = True
     ) -> tuple[dict[str, Any], httpx.Response]:
-        client = await self._get_client()
         cookies = await self._cookies() if use_cookie else None
-        response: httpx.Response | None = None
-        for attempt in range(REQUEST_ATTEMPTS):
+        response = await self._get_response(url, params, cookies)
+        if response.status_code == 412 and use_cookie and cookies:
+            # 失效/异常的 Cookie 可能触发 B 站风控（412），去掉 Cookie 匿名重试一次
+            logger.debug(
+                "B 站接口返回 412，Cookie 可能已失效，尝试去除 Cookie 匿名重试"
+            )
             try:
-                response = await client.get(url, params=params, cookies=cookies)
-                break
-            except httpx.TransportError as exc:
-                if attempt == REQUEST_ATTEMPTS - 1:
-                    raise BilibiliApiError(
-                        f"连接 B 站失败，已重试 {REQUEST_ATTEMPTS} 次：{exc}"
-                    ) from exc
-                await asyncio.sleep(REQUEST_RETRY_DELAY * (2**attempt))
-        if response is None:  # pragma: no cover - the loop either succeeds or raises
-            raise BilibiliApiError("连接 B 站失败")
+                response = await self._get_response(url, params, None)
+            except BilibiliApiError as exc:
+                raise BilibiliApiError(
+                    "B 站风控拒绝了请求（412），去除 Cookie 重试仍失败，请稍后重试或重新使用 /bili login 登录"
+                ) from exc
         if response.status_code == 412:
             raise BilibiliApiError("B 站风控拒绝了请求，请先使用 /bili login 扫码登录并稍后重试")
         response.raise_for_status()
@@ -95,17 +169,49 @@ class BilibiliApi:
         if not isinstance(payload, dict):
             raise BilibiliApiError("B 站接口返回了无法识别的数据")
         code = int(payload.get("code", 0))
+        if code == -352 and use_cookie and cookies:
+            # 失效/异常的 Cookie 可能触发 B 站风控（-352），去掉 Cookie 匿名重试一次
+            logger.debug(
+                "B 站接口返回 -352，Cookie 可能已失效，尝试去除 Cookie 匿名重试"
+            )
+            try:
+                response = await self._get_response(url, params, None)
+                response.raise_for_status()
+                payload = response.json()
+            except (BilibiliApiError, httpx.HTTPError, ValueError):
+                raise BilibiliApiError(
+                    "B 站接口风控（-352），去除 Cookie 重试仍失败，请稍后重试或重新使用 /bili login 登录"
+                ) from None
+            if not isinstance(payload, dict):
+                raise BilibiliApiError("B 站接口返回了无法识别的数据")
+            code = int(payload.get("code", 0))
         if code != 0:
             message = payload.get("message") or payload.get("msg") or "未知错误"
             raise BilibiliApiError(f"B 站接口错误 {code}: {message}")
         return payload, response
 
     async def get_profile(self, uid: int) -> tuple[str, str]:
+        # 主播资料接口匿名即可访问，不携带 Cookie，避免失效 Cookie 触发风控
         payload = await self._get_json(
-            f"{self.API}/x/web-interface/card", {"mid": uid, "photo": "true"}
+            f"{self.API}/x/web-interface/card",
+            {"mid": uid, "photo": "true"},
+            use_cookie=False,
         )
         card = payload.get("data", {}).get("card", {})
         return str(card.get("name") or uid), str(card.get("face") or "")
+
+    async def _get_anchor(self, uid: int) -> tuple[str, str]:
+        # Fetch anchor name/avatar; retry once on failure, then fall back to the stored subscription name
+        for attempt in range(2):
+            try:
+                return await self.get_profile(uid)
+            except BilibiliApiError:
+                if attempt == 0:
+                    await asyncio.sleep(1)
+                    continue
+                fallback = await repository.get_uname(uid)
+                return (fallback or str(uid)), ""
+        return str(uid), ""  # pragma: no cover
 
     async def get_dynamics(self, uid: int) -> list[PushContent]:
         payload = await self._get_json(
@@ -342,10 +448,7 @@ class BilibiliApi:
         )
         room_info = payload.get("data") or {}
         uid = int(room_info.get("uid") or fallback_uid)
-        try:
-            anchor_name, anchor_avatar = await self.get_profile(uid)
-        except BilibiliApiError:
-            anchor_name, anchor_avatar = str(uid), ""
+        anchor_name, anchor_avatar = await self._get_anchor(uid)
         actual_action = action
         if actual_action is None:
             actual_action = (
